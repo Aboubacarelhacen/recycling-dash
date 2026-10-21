@@ -1,0 +1,124 @@
+# The whole product on one machine.
+#
+# Postgres sits beside the application rather than across a network, because
+# every screen here is server-rendered out of it: a page is a handful of
+# queries, and a 60 ms round trip to a database in another region turns into
+# most of a second on screen.
+#
+#   cd deploy && cp .env.example .env && edit it
+#   docker compose up -d --build
+
+name: africa-aluminium
+
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      # Deterministic ordering and dates, matching the application.
+      LANG: C.UTF-8
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    # Not published to the host: the application reaches it over the compose
+    # network, and nothing else should reach it at all.
+    expose:
+      - "5432"
+
+  app:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      NODE_ENV: production
+    # Chromium wants more than the 64 MB default, and a PDF of a full page is
+    # the one thing here that allocates in bursts.
+    shm_size: 256mb
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/api/health | grep -q ok"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    expose:
+      - "3000"
+
+  # Terminates TLS and renews the certificate on its own. The only service
+  # bound to a public port.
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - app
+    environment:
+      SITE_DOMAIN: ${SITE_DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+  # A nightly dump kept for a month. The company's purchase ledger is the
+  # product; losing it is the only unrecoverable failure here.
+  backup:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - ./backups:/backups
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        while true; do
+          stamp=$$(date -u +%Y-%m-%d_%H%M)
+          if pg_dump -h db -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -Fc \
+               -f "/backups/africa-aluminium-$$stamp.dump" 2>/tmp/err; then
+            echo "backup $$stamp ok"
+          else
+            echo "BACKUP FAILED $$stamp: $$(cat /tmp/err)"
+          fi
+          find /backups -name '*.dump' -mtime +30 -delete
+          sleep 86400
+        done
+    env_file:
+      - .env
+
+  # One-off jobs that need the development toolchain: the historical import
+  # runs TypeScript, and the runtime image deliberately carries neither tsx nor
+  # the source. Built from the build stage, and never started by `up` because
+  # of the profile.
+  tools:
+    profiles: ["tools"]
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: build
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+
+volumes:
+  db-data:
+  caddy-data:
+  caddy-config:
